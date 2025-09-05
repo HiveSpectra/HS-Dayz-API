@@ -1,0 +1,130 @@
+The plan (rock-solid, no surprises)
+1) DB-first logging (single source of truth)
+
+Treat the database as the canonical sink.
+
+Your existing hs_dayz_api_log already works — expand it to carry full request/response metadata so every call is captured even when the filesystem isn’t writable.
+
+Filesystem logs (uploads/hs-dayz-logs/raw-api.log) become an optional mirror, never a blocker.
+
+Log record shape (per request)
+
+Store one row per request with a stable req_id:
+
+ts (start time), duration_ms
+
+method, route (namespace + route), uri
+
+ip (remote), user_agent
+
+request_headers_json (sanitized; keep a masked copy for display)
+
+request_body_text (truncate with *_truncated=1 flag if > N KB)
+
+response_status, response_bytes
+
+error_flag, error_msg (if handler threw)
+
+serverauth_fingerprint (SHA-256 of the ServerAuth that came in Content-Type)
+
+raw_serverauth (optional, encrypted at rest) — never show raw in UI
+
+If payloads can be big, split bodies into a side table (hs_dayz_api_body) keyed by log_id, so the main table stays fast.
+
+2) Capture at two points in the REST lifecycle
+
+Use the REST server hooks so every hs-dayz/v1 endpoint is recorded automatically:
+
+Inbound: on dispatch start (captures method, path, headers, raw body, start time).
+Keep your current trick of caching php://input to $GLOBALS['hs_dayz_raw_input'] so you don’t consume the stream.
+
+Outbound: on dispatch end (captures status, response size, duration, error info).
+Update the same row by req_id.
+
+This way you log even when the handler fails, and you always have duration + status.
+
+3) Filesystem write as a best-effort mirror
+
+Try wp_mkdir_p( wp_upload_dir()['basedir'].'/hs-dayz-logs' ).
+
+If not writable → skip silently. DB logging already captured the request.
+
+When writable, append NDJSON lines to raw-api.log (easy to tail/ship) and rotate by size.
+
+The Monitor must never hard-fail because a folder can’t be created.
+
+4) Monitor tab (always works)
+
+Reads from DB by default with server-side pagination and filters:
+
+Time range, method, route, status, search (free-text across headers/body).
+
+If raw-api.log exists, offer a secondary panel that tails it (bonus, not required).
+
+If debug.log exists, show it as read-only context; otherwise just a small status banner.
+
+Useful filters
+
+“Errors only” (status ≥ 400 or error_flag=1)
+
+“By GUID / SteamID” (regex search in body)
+
+“By ServerAuth fingerprint” (debug auth mismatches quickly)
+
+Safe display (redaction)
+
+In the UI, mask any secrets:
+
+Content-Type: <ServerAuth> → show as sha256:abcd… plus ••• mask for the raw.
+
+If bodies can include tokens, apply regex redaction in the view layer.
+
+Keep the real values in the DB (encrypted if you choose), but never render them unmasked.
+
+5) Retention & size control
+
+DB: rolling retention — e.g., keep 30–90 days (or N rows). Add an index on ts and status.
+
+FS: rotate raw-api.log at, say, 10 MB; gzip old files; keep last 5.
+
+A daily WP-Cron job enforces both.
+
+6) Health & self-healing
+
+Activation probe: try to create the FS folder; if it fails, set sink status to DB-only and show a dismissible admin notice with a “Try again” button (uses WP Filesystem API — works on hosts that require FTP/SSH creds).
+
+Settings → Logging: show live status (DB ok / FS ok), buttons to:
+
+Write test entry
+
+Create folder
+
+Rotate now
+
+Export last N requests (CSV / NDJSON)
+
+7) Security & correctness
+
+Never let logging break the API: all writes are best-effort with try/catch.
+
+Timestamp and req_id are generated before controller runs; even fatal handlers still yield a log row.
+
+Don’t log full request bodies for super-sensitive routes if you add any (allow per-route suppression), but for DayZ mod APIs your goal is full fidelity, so default to on.
+
+What changes in your current plugin
+
+You already have most pieces:
+
+✅ DB table exists (hs_dayz_api_log) and is being written to in several endpoints.
+
+✅ Raw input caching exists ($GLOBALS['hs_dayz_raw_input']).
+
+❗ Make DB the primary sink by ensuring every handler path logs to DB first (it mostly does).
+
+❗ Wrap FS writes in a writable check + wp_mkdir_p (don’t throw), and move Monitor paths to use wp_upload_dir().
+
+❗ Add post-dispatch logging (status, bytes, duration) so each row is complete even on errors.
+
+❗ Redact in the Monitor view (mask ServerAuth; show fingerprint).
+
+That gives you “plug-and-play” reliability on brand-new sites: you’ll always see the traffic in the Monitor (DB), and you’ll sometimes also have a tail-able raw-api.log when the host allows it.
